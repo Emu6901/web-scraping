@@ -8,8 +8,9 @@ authors = ["Your Name <you@example.com>"]
 python = "^3.8"
 selenium = "^4.3.0"
 pandas = "^1.4.3"
-webdriver-manager = "^3.7.1"
+webdriver-manager = "^3.8.0"
 black = "^22.6.0"
+bs4 = "^0.0.1"
 
 [tool.poetry.dev-dependencies]
 pytest = "^5.2"
