@@ -1,5 +1,4 @@
 import time
-from tkinter import W
 import pandas as pd
 import csv
 import re
@@ -11,6 +10,11 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.action_chains import ActionChains
+import json
+from multiprocessing.pool import ThreadPool
+import threading
+import gc
+from multiprocessing import Process, Value, Array
 
 
 class CFG:
@@ -44,12 +48,7 @@ class CFG:
         "Nội dung",
     ]
     book_id = 0
-    MAX_COMMENT_NUMBER = 1
-    MAX_REPLY_NUMBER = 1
-
-    # Temp variable when running
-    current_page = 0
-    current_book_index = 0
+    MAX_REPLY_NUMBER = 10
 
 
 class Utilily:
@@ -76,6 +75,33 @@ class Utilily:
             return default_return
 
 
+class Driver:
+    def __init__(self):
+        chrome_options = Options()
+        chrome_options.add_argument("--incognito")
+        # chrome_options.add_argument("--start-maximized")
+        # chrome_options.add_argument("--headless")
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
+        self.driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()), options=chrome_options
+        )
+
+    def __del__(self):
+        self.driver.quit()  # clean up driver when we are cleaned up
+        print('The driver has been "quitted".')
+
+    @classmethod
+    def create_driver(cls):
+        the_driver = getattr(CFG.threadLocal, "the_driver", None)
+        if the_driver is None:
+            print("Creating new driver.")
+            the_driver = cls()
+            CFG.threadLocal.the_driver = the_driver
+        driver = the_driver.driver
+        the_driver = None
+        return driver
+
+
 class Setup:
     def setup_driver():
         chrome_options = Options()
@@ -83,27 +109,16 @@ class Setup:
         chrome_options.add_argument("--start-maximized")
         # chrome_options.add_argument("--headless")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
-        CFG.driver = webdriver.Chrome(
+        return webdriver.Chrome(
             service=Service(ChromeDriverManager().install()), options=chrome_options
         )
-        CFG.driver.delete_network_conditions()
-        CFG.driver.set_network_conditions(
-            offline=False,
-            latency=5,  # additional latency (ms)
-            download_throughput=500 * 1024,  # maximal throughput
-            upload_throughput=500 * 1024,  # maximal throughput
-        )
-        CFG.driver.delete_all_cookies()
-        CFG.driver.get(CFG.url)
-        CFG.wait = WebDriverWait(CFG.driver, 10)
-        CFG.action = ActionChains(CFG.driver)
 
     def setup_writer(filename, headers):
-        file = open(filename, "w", newline="", encoding="utf-8")
+        file = open(filename, "a", newline="", encoding="utf-8")
         writer = csv.DictWriter(
             file, delimiter=",", lineterminator="\n", fieldnames=headers
         )
-        writer.writeheader()
+        # writer.writeheader()
         return writer
 
 
@@ -123,10 +138,16 @@ class Find:
         else:
             return False
 
-    def find_comment_ids():
+    def find_comments():
         comments = CFG.driver.find_elements(by=By.CLASS_NAME, value="review")
-        elements = [comment.get_attribute("id") for comment in comments]
-        return elements
+        ids = [comment.get_attribute("id") for comment in comments]
+        urls = [
+            comment.find_element(by=By.CLASS_NAME, value="reviewDate").get_attribute(
+                "href"
+            )
+            for comment in comments
+        ]
+        return ids, urls
 
     def find_reply_ids():
         replies = CFG.driver.find_elements(by=By.CLASS_NAME, value="comment")
@@ -241,106 +262,90 @@ class GetInformation:
         )
 
 
-def move_to_next_page(add_current_page=False):
-    next_page = Find.find_next_page(CFG.driver)
-    if next_page:
-        try:
-            next_page.click()
-        except:
-            print(next_page.location)
-            CFG.action.move_to_element(next_page).move_by_offset(
-                -40, 0
-            ).click().perform()
-            next_page.click()
-            time.sleep(2)
-        finally:
-            if add_current_page:
-                CFG.current_page += 1
-                CFG.current_book_index = 19
-            return True
-    else:
-        return False
+def scraper(url, comment_id):
+    """
+    This now scrapes a single URL.
+    """
+    driver = Driver.create_driver()
+    driver.get(url)
+    time.sleep(2)
+    comment_container = WebDriverWait(driver, 20).until(
+        lambda d: d.find_element(by=By.CLASS_NAME, value="leftContainer")
+    )
+    GetInformation.extract_comment(comment_container, comment_id)
+    reply_ids = Find.find_reply_ids()
+    reply_index = 0
+    while reply_index < min(len(reply_ids), CFG.MAX_REPLY_NUMBER):
+        reply_id = reply_ids[reply_index]
+        reply_index += 1
+        GetInformation.extract_reply(reply_id, comment_id)
 
 
 def crawl():
+    CFG.driver = Setup.setup_driver()
+    CFG.driver.delete_network_conditions()
+    CFG.driver.set_network_conditions(
+        offline=False,
+        latency=5,  # additional latency (ms)
+        download_throughput=500 * 1024,  # maximal throughput
+        upload_throughput=500 * 1024,  # maximal throughput
+    )
+    CFG.driver.delete_all_cookies()
+    CFG.driver.get(CFG.url)
+    CFG.wait = WebDriverWait(CFG.driver, 20)
+    CFG.action = ActionChains(CFG.driver)
     CFG.book_writer = Setup.setup_writer(CFG.book_file, CFG.book_headers)
     CFG.comment_writer = Setup.setup_writer(CFG.comment_file, CFG.comment_headers)
     CFG.reply_writer = Setup.setup_writer(CFG.reply_file, CFG.reply_headers)
 
-    Setup.setup_driver()
-
     while True:
-        try:
-            books = CFG.wait.until(Find.find_books)
-            book_index = 19
-            if CFG.current_book_index != 0:
-                book_index = CFG.current_book_index
-            if book_index > len(books):
-                break
-            while book_index < len(books):
-                print(book_index)
-                book = books[book_index]
-                book_index += 1
-                CFG.book_id += 1
+        books = CFG.wait.until(Find.find_books)
+        book_index = 0
+        while book_index < len(books):
+            book = books[book_index]
+            book_index += 1
+            CFG.book_id += 1
+            CFG.action.move_to_element(book).move_by_offset(-40, 0).click().perform()
+            book.click()
+            time.sleep(2)
+            book_container = CFG.driver.find_element(
+                by=By.CLASS_NAME, value="leftContainer"
+            )
+            GetInformation.extract_book(book_container)
 
-                CFG.action.move_to_element(book).move_by_offset(
+            comment_ids, comment_urls = Find.find_comments()
+            CFG.threadLocal = threading.local()
+            number_of_processes = min(2, len(comment_urls))
+            with ThreadPool(processes=number_of_processes) as pool:
+                result_array = pool.starmap(scraper, zip(comment_urls, comment_ids))
+                try:
+                    del CFG.threadLocal
+                    gc.collect()
+                except Exception as e:
+                    print(e)
+
+                pool.close()
+                pool.join()
+
+            CFG.driver.back()
+            time.sleep(1)
+            books = CFG.wait.until(Find.find_books)
+            time.sleep(1)
+
+        next_page = Find.find_next_page(CFG.driver)
+        if next_page:
+            try:
+                next_page.click()
+            except:
+                print(next_page.location)
+                CFG.action.move_to_element(next_page).move_by_offset(
                     -40, 0
                 ).click().perform()
-                book.click()
+                next_page.click()
                 time.sleep(2)
-                book_container = CFG.driver.find_element(
-                    by=By.CLASS_NAME, value="leftContainer"
-                )
-                GetInformation.extract_book(book_container)
-
-                comment_ids = Find.find_comment_ids()
-                comment_index = 0
-                while comment_index < min(len(comment_ids), CFG.MAX_COMMENT_NUMBER):
-                    comment_id = comment_ids[comment_index]
-                    comment_index += 1
-                    see_review = CFG.driver.find_element(
-                        by=By.XPATH,
-                        value='//*[@id="{0}"]/div[1]/div[1]/a'.format(comment_id),
-                    )
-                    CFG.action.move_to_element(see_review).move_by_offset(
-                        -see_review.location["x"] + 1, 0
-                    ).click().perform()
-                    CFG.action.move_to_element(see_review).click(see_review).perform()
-                    time.sleep(2)
-                    comment_container = CFG.driver.find_element(
-                        by=By.CLASS_NAME, value="leftContainer"
-                    )
-                    GetInformation.extract_comment(comment_container, comment_id)
-
-                    reply_ids = Find.find_reply_ids()
-                    reply_index = 0
-                    while reply_index < min(len(reply_ids), CFG.MAX_REPLY_NUMBER):
-                        reply_id = reply_ids[reply_index]
-                        reply_index += 1
-                        GetInformation.extract_reply(reply_id, comment_id)
-
-                    CFG.driver.back()
-                    time.sleep(2)
-
-                CFG.driver.back()
-                time.sleep(1)
-                books = CFG.wait.until(Find.find_books)
-                time.sleep(1)
-                if not move_to_next_page(add_current_page=True):
-                    break
-
-        except Exception as e:
-            print("Exception", e, CFG.current_book_index, CFG.current_page)
-            CFG.current_book_index = book_index - 1
-            CFG.driver.quit()
-            Setup.setup_driver()
-            page = 0
-            while page < CFG.current_page-1:
-                print("NEXT PAGE")
-                if not move_to_next_page():
-                    break
-                page += 1
+        else:
+            break
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     crawl()
