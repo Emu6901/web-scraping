@@ -80,7 +80,7 @@ class Driver:
         chrome_options = Options()
         chrome_options.add_argument("--incognito")
         # chrome_options.add_argument("--start-maximized")
-        # chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--headless")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
         self.driver = webdriver.Chrome(
             service=Service(ChromeDriverManager().install()), options=chrome_options
@@ -149,8 +149,8 @@ class Find:
         ]
         return ids, urls
 
-    def find_reply_ids():
-        replies = CFG.driver.find_elements(by=By.CLASS_NAME, value="comment")
+    def find_reply_ids(driver):
+        replies = driver.find_elements(by=By.CLASS_NAME, value="comment")
         elements = [reply.get_attribute("id") for reply in replies]
         return elements
 
@@ -245,9 +245,9 @@ class GetInformation:
             }
         )
 
-    def extract_reply(reply_id, comment_id):
+    def extract_reply(driver, reply_id, comment_id):
         # ["ID bình luận","Tên người bình luận","Ngày bình luận","Nội dung"]
-        reply = CFG.driver.find_element(by=By.ID, value=reply_id)
+        reply = driver.find_element(by=By.ID, value=reply_id)
         replyAuthor = reply.find_element(by=By.CLASS_NAME, value="commentAuthor").text
         replyTime = reply.find_element(by=By.CLASS_NAME, value="right").text
         replyText = reply.find_element(by=By.CLASS_NAME, value="reviewText").text
@@ -268,17 +268,21 @@ def scraper(url, comment_id):
     """
     driver = Driver.create_driver()
     driver.get(url)
-    time.sleep(2)
-    comment_container = WebDriverWait(driver, 20).until(
-        lambda d: d.find_element(by=By.CLASS_NAME, value="leftContainer")
-    )
+    wait = WebDriverWait(driver, 20)
+    try:
+        comment_container = wait.until(
+            lambda d: d.find_element(by=By.CLASS_NAME, value="leftContainer")
+        )
+    except:
+        return
     GetInformation.extract_comment(comment_container, comment_id)
-    reply_ids = Find.find_reply_ids()
+    time.sleep(2)
+    reply_ids = Find.find_reply_ids(driver)
     reply_index = 0
     while reply_index < min(len(reply_ids), CFG.MAX_REPLY_NUMBER):
         reply_id = reply_ids[reply_index]
         reply_index += 1
-        GetInformation.extract_reply(reply_id, comment_id)
+        GetInformation.extract_reply(driver, reply_id, comment_id)
 
 
 def crawl():
@@ -299,38 +303,41 @@ def crawl():
     CFG.reply_writer = Setup.setup_writer(CFG.reply_file, CFG.reply_headers)
 
     while True:
-        books = CFG.wait.until(Find.find_books)
-        book_index = 0
-        while book_index < len(books):
-            book = books[book_index]
-            book_index += 1
-            CFG.book_id += 1
-            CFG.action.move_to_element(book).move_by_offset(-40, 0).click().perform()
-            book.click()
-            time.sleep(2)
-            book_container = CFG.driver.find_element(
-                by=By.CLASS_NAME, value="leftContainer"
-            )
-            GetInformation.extract_book(book_container)
-
-            comment_ids, comment_urls = Find.find_comments()
-            CFG.threadLocal = threading.local()
-            number_of_processes = min(2, len(comment_urls))
-            with ThreadPool(processes=number_of_processes) as pool:
-                result_array = pool.starmap(scraper, zip(comment_urls, comment_ids))
-                try:
-                    del CFG.threadLocal
-                    gc.collect()
-                except Exception as e:
-                    print(e)
-
-                pool.close()
-                pool.join()
-
-            CFG.driver.back()
-            time.sleep(1)
+        try:
             books = CFG.wait.until(Find.find_books)
-            time.sleep(1)
+            book_index = 0
+            while book_index < len(books):
+                book = books[book_index]
+                book_index += 1
+                CFG.book_id += 1
+                CFG.action.move_to_element(book).move_by_offset(-40, 0).click().perform()
+                book.click()
+                time.sleep(2)
+                book_container = CFG.driver.find_element(
+                    by=By.CLASS_NAME, value="leftContainer"
+                )
+                GetInformation.extract_book(book_container)
+
+                comment_ids, comment_urls = Find.find_comments()
+                CFG.threadLocal = threading.local()
+                number_of_processes = min(4, len(comment_urls))
+                with ThreadPool(processes=number_of_processes) as pool:
+                    result_array = pool.starmap(scraper, zip(comment_urls, comment_ids))
+                    try:
+                        del CFG.threadLocal
+                        gc.collect()
+                    except Exception as e:
+                        print(e)
+
+                    pool.close()
+                    pool.join()
+
+                CFG.driver.back()
+                time.sleep(1)
+                books = CFG.wait.until(Find.find_books)
+                time.sleep(1)
+        except:
+            CFG.driver.back()
 
         next_page = Find.find_next_page(CFG.driver)
         if next_page:
